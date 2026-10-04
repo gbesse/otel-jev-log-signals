@@ -1,0 +1,23 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "checkout"}}]},
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1720000000000000000",
+              "body": {"stringValue": "payment call failed after 3 retries"},
+              "attributes": [{"key": "log.record.template", "value": {"stringValue": "payment call failed after <*> retries"}}]
+            },
+            {
+              "timeUnixNano": "1720000001000000000",
+              "body": {"stringValue": "payment call failed after 5 retries"},
+              "attributes": [{"key": "log.record.template", "value": {"stringValue": "payment call failed after <*> retries"}}]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
