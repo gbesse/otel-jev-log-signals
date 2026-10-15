@@ -42,7 +42,7 @@ class RelayTests(unittest.TestCase):
 
     def test_http_forwards_and_failure_is_retryable(self):
         payload = json.dumps(fixture()).encode()
-        sent = Mock()
+        sent = Mock(return_value=b"{}")
         app = make_app(TemplateCache(lambda _: ("incident", 0.95)),
                        "http://127.0.0.1:4318/v1/logs", send=sent)
 
@@ -81,3 +81,54 @@ class RelayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcknowledgementTests(unittest.TestCase):
+    def test_partial_and_warning_remain_visible_in_all_languages(self):
+        from relay import acknowledgement, TEXT
+        for lang in TEXT:
+            result = json.loads(acknowledgement(b'{"partialSuccess":{"rejectedLogRecords":"1","errorMessage":"private upstream log"}}', 2, lang))
+            self.assertEqual(result['partialSuccess']['rejectedLogRecords'], '1')
+            self.assertEqual(result['partialSuccess']['errorMessage'], TEXT[lang])
+            self.assertNotIn('private upstream log', json.dumps(result))
+            warning = json.loads(acknowledgement(b'{"partialSuccess":{"errorMessage":"warning"}}', 2, lang))
+            self.assertEqual(warning['partialSuccess']['rejectedLogRecords'], '0')
+
+    def test_invalid_partial_is_not_acknowledged_as_full_success(self):
+        from relay import acknowledgement
+        for value in ({'partialSuccess': []}, {'partialSuccess': {'rejectedLogRecords': True}},
+                      {'partialSuccess': {'rejectedLogRecords': '-1'}}, {'partialSuccess': {'rejectedLogRecords': '3'}},
+                      {'partialSuccess': {'rejectedLogRecords': 0.5}}, {'partialSuccess': {'errorMessage': []}}, []):
+            with self.subTest(value=value), self.assertRaises((DecisionError, ValueError)):
+                acknowledgement(json.dumps(value), 2)
+
+    def test_wsgi_returns_partial_success_without_retry_status(self):
+        payload = json.dumps(fixture()).encode(); status = []
+        app = make_app(TemplateCache(lambda _: ('incident', .95)), 'http://localhost:4318/v1/logs',
+                       send=lambda *args: b'{"partialSuccess":{"rejectedLogRecords":"1"}}', lang='fr')
+        body = b''.join(app({'REQUEST_METHOD':'POST', 'PATH_INFO':'/v1/logs', 'CONTENT_LENGTH':str(len(payload)),
+                            'CONTENT_TYPE':'application/json', 'wsgi.input':io.BytesIO(payload)},
+                           lambda code, headers: status.append(code)))
+        self.assertEqual(status, ['200 OK'])
+        self.assertEqual(json.loads(body)['partialSuccess']['rejectedLogRecords'], '1')
+
+    def test_bounded_upstream_read(self):
+        from relay import forward, MAX_RESPONSE
+        response = Mock();response.__enter__ = Mock(return_value=response);response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'x' * (MAX_RESPONSE + 1)
+        with self.assertRaises(DecisionError):forward('http://localhost:4318/v1/logs', {}, opener=lambda *a, **k:response)
+        response.read.assert_called_once_with(MAX_RESPONSE + 1)
+
+    def test_redirect_is_refused_instead_of_reposting(self):
+        from relay import NoRedirect
+        from urllib.request import Request
+        from urllib.error import HTTPError
+        with self.assertRaises(HTTPError):
+            NoRedirect().redirect_request(Request('https://example.test/v1/logs'), None, 307, 'redirect', {}, 'http://other.test/v1/logs')
+
+    def test_invalid_acknowledgement_is_non_retryable(self):
+        payload=json.dumps(fixture()).encode();status=[]
+        app=make_app(TemplateCache(lambda _: ('incident', .95)), 'http://localhost:4318/v1/logs', send=lambda *args:b'not JSON')
+        b''.join(app({'REQUEST_METHOD':'POST','PATH_INFO':'/v1/logs','CONTENT_LENGTH':str(len(payload)),
+                     'CONTENT_TYPE':'application/json','wsgi.input':io.BytesIO(payload)},lambda code,headers:status.append(code)))
+        self.assertEqual(status,['500 Internal Server Error'])
