@@ -5,8 +5,10 @@ from copy import deepcopy
 import json
 import math
 import os
+import re
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.error import HTTPError
 from wsgiref.simple_server import make_server
 
 API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -18,6 +20,20 @@ CRITERIA = {
     "other": "The template is ambiguous or provides too little context.",
 }
 POLICY_VERSION = "0.1.0"
+MAX_RESPONSE = 1024 * 1024
+TEXT = {
+    "en": "The upstream reported partial acceptance or a warning; inspect its local diagnostics.",
+    "fr": "La destination a signalé une acceptation partielle ou un avertissement ; consultez ses diagnostics locaux.",
+    "es": "El destino indicó aceptación parcial o una advertencia; consulte sus diagnósticos locales.",
+}
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, "redirect_refused", headers, fp)
+
+
+urlopen = build_opener(NoRedirect()).open
 MAX_BODY = 1024 * 1024
 MAX_TEMPLATE = 16000
 RESERVED = {"jev.log.outcome", "jev.log.probability", "jev.log.policy_version"}
@@ -28,6 +44,10 @@ class InvalidPayload(ValueError):
 
 
 class DecisionError(Exception):
+    pass
+
+
+class AcknowledgementError(DecisionError):
     pass
 
 
@@ -52,12 +72,18 @@ def decide(template, key, *, opener=urlopen):
                        "Content-Type": "application/json"}, method="POST")
     try:
         with opener(request, timeout=20) as response:
-            result = json.load(response)
+            raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise DecisionError("response_too_large")
+            result = json.loads(raw)
     except Exception as exc:
         raise DecisionError("request_failed") from exc
     if not isinstance(result, dict) or result.get("model") != MODEL:
         raise DecisionError("model_mismatch")
-    answer = result.get("answers", {}).get(QUESTION, {})
+    answers = result.get("answers")
+    if not isinstance(answers, dict):
+        raise DecisionError("invalid_answer")
+    answer = answers.get(QUESTION, {})
     if not isinstance(answer, dict):
         raise DecisionError("invalid_answer")
     choice = answer.get("choice")
@@ -150,10 +176,48 @@ def forward(upstream, payload, *, opener=urlopen):
     request = Request(validate_upstream(upstream), data=body,
                       headers={"Content-Type": "application/json"}, method="POST")
     with opener(request, timeout=20) as response:
-        return response.read()
+        body = response.read(MAX_RESPONSE + 1)
+        if len(body) > MAX_RESPONSE:
+            raise AcknowledgementError("response_too_large")
+        return body
 
 
-def make_app(cache, upstream, *, send=forward):
+def acknowledgement(body, record_count, lang="en"):
+    """Keep OTLP partial acceptance visible, without relaying provider text."""
+    if body is None:
+        body = b"{}"
+    if not isinstance(body, (bytes, str)) or len(body) > MAX_RESPONSE:
+        raise AcknowledgementError("invalid_acknowledgement")
+    try:
+        value = json.loads(body or b"{}")
+    except (ValueError, UnicodeError) as exc:
+        raise AcknowledgementError("invalid_acknowledgement") from exc
+    if not isinstance(value, dict):
+        raise AcknowledgementError("invalid_acknowledgement")
+    if "partialSuccess" not in value:
+        return b"{}"
+    partial = value["partialSuccess"]
+    if not isinstance(partial, dict):
+        raise AcknowledgementError("invalid_acknowledgement")
+    count = partial.get("rejectedLogRecords", "0")
+    if isinstance(count, bool) or not isinstance(count, (int, str)) or not re.fullmatch(r"[0-9]+", str(count)):
+        raise AcknowledgementError("invalid_acknowledgement")
+    count = int(count)
+    if count > record_count or count > 2**63 - 1:
+        raise AcknowledgementError("invalid_acknowledgement")
+    message = partial.get("errorMessage", "")
+    if not isinstance(message, str):
+        raise AcknowledgementError("invalid_acknowledgement")
+    # A populated partialSuccess remains populated even with zero rejections.
+    result = {"partialSuccess": {"rejectedLogRecords": str(count)}}
+    if message or count:
+        result["partialSuccess"]["errorMessage"] = TEXT[lang]
+    return json.dumps(result, ensure_ascii=False).encode()
+
+
+def make_app(cache, upstream, *, send=forward, lang="en"):
+    if lang not in TEXT:
+        raise ValueError("invalid_language")
     upstream = validate_upstream(upstream)
 
     def app(environ, start_response):
@@ -180,12 +244,15 @@ def make_app(cache, upstream, *, send=forward):
             start_response("503 Service Unavailable", [("Content-Type", "application/json")])
             return [b"{}"]
         try:
-            send(upstream, enriched)
+            response_body = acknowledgement(send(upstream, enriched), sum(1 for _ in _records(enriched)), lang)
+        except AcknowledgementError:
+            start_response("500 Internal Server Error", [("Content-Type", "application/json")])
+            return [b"{}"]
         except Exception:
             start_response("503 Service Unavailable", [("Content-Type", "application/json")])
             return [b"{}"]
         start_response("200 OK", [("Content-Type", "application/json")])
-        return [b"{}"]
+        return [response_body]
     return app
 
 
@@ -193,6 +260,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--lang", choices=TEXT, default="en")
     args = parser.parse_args()
     if args.demo == args.serve:
         parser.error("select exactly one of --demo or --serve")
@@ -205,7 +273,7 @@ def main():
     key = os.environ["TYPESAFE_API_KEY"]
     upstream = validate_upstream(os.environ["OTLP_UPSTREAM_URL"])
     cache = TemplateCache(lambda template: decide(template, key))
-    app = make_app(cache, upstream)
+    app = make_app(cache, upstream, lang=args.lang)
     with make_server("127.0.0.1", int(os.environ.get("PORT", "8091")), app) as server:
         server.serve_forever()
 
